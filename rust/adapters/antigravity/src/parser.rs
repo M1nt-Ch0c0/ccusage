@@ -139,12 +139,19 @@ struct ProtoField<'a> {
 
 type ProtoResult<T> = std::result::Result<T, &'static str>;
 
+/// Why `parse_sqlite_file` skipped a database.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SkipReason {
+    Empty,
+    NotConversation,
+}
+
 /// Parses one Antigravity conversation database in ascending generation order.
-/// Returns `None` for an empty file, or a non-strict file without `gen_metadata`.
+/// Returns a `SkipReason` for an empty file, or a non-strict file without `gen_metadata`.
 pub(super) fn parse_sqlite_file(
     path: &Path,
     strict: bool,
-) -> Result<Option<Vec<AntigravityUsageEvent>>> {
+) -> Result<std::result::Result<Vec<AntigravityUsageEvent>, SkipReason>> {
     let fallback_timestamp = file_modified_timestamp(path);
     let connection =
         sqlite::Connection::open_with_flags(path, sqlite::OpenFlags::new().with_read_only())
@@ -162,10 +169,11 @@ pub(super) fn parse_sqlite_file(
                 path.display()
             ))
         })?;
-    if database_snapshot_is_empty(&connection, path)?
-        || (!strict && !table_exists(&connection, "gen_metadata", path)?)
-    {
-        return Ok(None);
+    if database_snapshot_is_empty(&connection, path)? {
+        return Ok(Err(SkipReason::Empty));
+    }
+    if !strict && !table_exists(&connection, "gen_metadata", path)? {
+        return Ok(Err(SkipReason::NotConversation));
     }
     let session_id = path
         .file_stem()
@@ -290,7 +298,7 @@ pub(super) fn parse_sqlite_file(
             );
         }
     }
-    Ok(Some(events))
+    Ok(Ok(events))
 }
 
 fn database_snapshot_is_empty(connection: &sqlite::Connection, path: &Path) -> Result<bool> {

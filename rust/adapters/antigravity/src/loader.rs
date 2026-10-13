@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use crate::{LoadedEntry, PricingMap, Result, cli::SharedArgs, debug_log, parse_tz};
 
 use super::{
-    parser::{AntigravityUsageEvent, event_to_loaded, merge_usage_event, parse_sqlite_file},
+    parser::{
+        AntigravityUsageEvent, SkipReason, event_to_loaded, merge_usage_event, parse_sqlite_file,
+    },
     paths::conversation_db_paths,
 };
 
@@ -22,11 +24,18 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
     let mut parsed_events = Vec::new();
     for (database_path, strict) in database_paths {
         match parse_sqlite_file(&database_path, strict)? {
-            Some(events) => parsed_events.extend(events),
-            None => debug_log(
+            Ok(events) => parsed_events.extend(events),
+            Err(SkipReason::Empty) => debug_log(
                 shared,
                 format!(
-                    "Skipping Antigravity database '{}': empty, or not a conversation database",
+                    "Skipping empty Antigravity database '{}'",
+                    database_path.display()
+                ),
+            ),
+            Err(SkipReason::NotConversation) => debug_log(
+                shared,
+                format!(
+                    "Skipping Antigravity database '{}': no gen_metadata table, not a conversation database",
                     database_path.display()
                 ),
             ),
@@ -756,7 +765,10 @@ mod tests {
         let fixture = Fixture::new();
         let database = fixture.write_file("conversations/empty.db", "");
 
-        assert!(parse_sqlite_file(&database, true).unwrap().is_none());
+        assert_eq!(
+            parse_sqlite_file(&database, true).unwrap().unwrap_err(),
+            SkipReason::Empty
+        );
 
         let entries = load_from_fixture(&fixture, true);
 
@@ -826,6 +838,21 @@ mod tests {
                 "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '')",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn explicit_data_dir_with_only_summaries_database_still_errors() {
+        // An explicit ANTIGRAVITY_DATA_DIR stays strict on purpose.
+        let fixture = Fixture::new();
+        create_summaries_database(&fixture.path("conversation_summaries.db"));
+        let _guard = EnvVarsGuard::set_many([(
+            super::super::paths::ANTIGRAVITY_DATA_DIR_ENV,
+            Some(OsString::from(fixture.root())),
+        )]);
+
+        let error = load_entries(&shared(true), &PricingMap::load_embedded()).unwrap_err();
+
+        assert!(error.to_string().contains("gen_metadata"));
     }
 
     fn load_from_home(fixture: &Fixture) -> Result<Vec<LoadedEntry>> {
