@@ -140,7 +140,11 @@ struct ProtoField<'a> {
 type ProtoResult<T> = std::result::Result<T, &'static str>;
 
 /// Parses one Antigravity conversation database in ascending generation order.
-pub(super) fn parse_sqlite_file(path: &Path) -> Result<Option<Vec<AntigravityUsageEvent>>> {
+/// Returns `None` for an empty file, or a non-strict file without `gen_metadata`.
+pub(super) fn parse_sqlite_file(
+    path: &Path,
+    strict: bool,
+) -> Result<Option<Vec<AntigravityUsageEvent>>> {
     let fallback_timestamp = file_modified_timestamp(path);
     let connection =
         sqlite::Connection::open_with_flags(path, sqlite::OpenFlags::new().with_read_only())
@@ -158,7 +162,9 @@ pub(super) fn parse_sqlite_file(path: &Path) -> Result<Option<Vec<AntigravityUsa
                 path.display()
             ))
         })?;
-    if database_snapshot_is_empty(&connection, path)? {
+    if database_snapshot_is_empty(&connection, path)?
+        || (!strict && !table_exists(&connection, "gen_metadata", path)?)
+    {
         return Ok(None);
     }
     let session_id = path
