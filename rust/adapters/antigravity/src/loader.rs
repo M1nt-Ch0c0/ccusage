@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use crate::{LoadedEntry, PricingMap, Result, cli::SharedArgs, debug_log, parse_tz};
 
 use super::{
-    parser::{AntigravityUsageEvent, event_to_loaded, merge_usage_event, parse_sqlite_file},
+    parser::{
+        AntigravityUsageEvent, SkipReason, event_to_loaded, merge_usage_event, parse_sqlite_file,
+    },
     paths::conversation_db_paths,
 };
 
@@ -20,13 +22,20 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
     let timezone = parse_tz(shared.timezone.as_deref());
     let database_paths = conversation_db_paths()?;
     let mut parsed_events = Vec::new();
-    for database_path in database_paths {
-        match parse_sqlite_file(&database_path)? {
-            Some(events) => parsed_events.extend(events),
-            None => debug_log(
+    for (database_path, strict) in database_paths {
+        match parse_sqlite_file(&database_path, strict)? {
+            Ok(events) => parsed_events.extend(events),
+            Err(SkipReason::Empty) => debug_log(
                 shared,
                 format!(
-                    "Skipping uninitialized Antigravity database '{}': empty SQLite snapshot",
+                    "Skipping empty Antigravity database '{}'",
+                    database_path.display()
+                ),
+            ),
+            Err(SkipReason::NotConversation) => debug_log(
+                shared,
+                format!(
+                    "Skipping Antigravity database '{}': no gen_metadata table, not a conversation database",
                     database_path.display()
                 ),
             ),
@@ -756,7 +765,10 @@ mod tests {
         let fixture = Fixture::new();
         let database = fixture.write_file("conversations/empty.db", "");
 
-        assert!(parse_sqlite_file(&database).unwrap().is_none());
+        assert_eq!(
+            parse_sqlite_file(&database, true).unwrap().unwrap_err(),
+            SkipReason::Empty
+        );
 
         let entries = load_from_fixture(&fixture, true);
 
@@ -814,6 +826,97 @@ mod tests {
         )]);
 
         let error = load_entries(&shared(true), &PricingMap::load_embedded()).unwrap_err();
+
+        assert!(error.to_string().contains("gen_metadata"));
+    }
+
+    fn create_summaries_database(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let connection = sqlite::open(path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '')",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn explicit_data_dir_with_only_summaries_database_still_errors() {
+        // An explicit ANTIGRAVITY_DATA_DIR stays strict on purpose.
+        let fixture = Fixture::new();
+        create_summaries_database(&fixture.path("conversation_summaries.db"));
+        let _guard = EnvVarsGuard::set_many([(
+            super::super::paths::ANTIGRAVITY_DATA_DIR_ENV,
+            Some(OsString::from(fixture.root())),
+        )]);
+
+        let error = load_entries(&shared(true), &PricingMap::load_embedded()).unwrap_err();
+
+        assert!(error.to_string().contains("gen_metadata"));
+    }
+
+    fn load_from_home(fixture: &Fixture) -> Result<Vec<LoadedEntry>> {
+        let _guard = EnvVarsGuard::set_many([
+            (super::super::paths::ANTIGRAVITY_DATA_DIR_ENV, None),
+            ("HOME", Some(OsString::from(fixture.root()))),
+            ("USERPROFILE", Some(OsString::from(fixture.root()))),
+        ]);
+        load_entries(&shared(true), &PricingMap::load_embedded())
+    }
+
+    #[test]
+    fn returns_empty_report_when_root_only_has_summaries_database() {
+        // A fresh `agy` login has no `conversations/` yet, only this file.
+        let fixture = Fixture::new();
+        create_summaries_database(
+            &fixture.path(".gemini/antigravity-cli/conversation_summaries.db"),
+        );
+
+        assert!(load_from_home(&fixture).unwrap().is_empty());
+    }
+
+    #[test]
+    fn skips_non_conversation_databases_found_by_root_fallback_scan() {
+        let fixture = Fixture::new();
+        create_summaries_database(
+            &fixture.path(".gemini/antigravity-cli/conversation_summaries.db"),
+        );
+        create_database(
+            &fixture.path(".gemini/antigravity/conversations/session.db"),
+            &[(
+                1,
+                metadata_blob(
+                    Some("gemini-3-pro"),
+                    Some(UsageFixture {
+                        input_tokens: 10,
+                        total_output_tokens: 5,
+                        visible_output_tokens: 5,
+                        response_id: Some("valid-response"),
+                        ..UsageFixture::default()
+                    }),
+                    Some((1_778_000_000, 0)),
+                    &[],
+                ),
+            )],
+            &[],
+            &[],
+        );
+
+        let entries = load_from_home(&fixture).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].data.message.id.as_deref(),
+            Some("valid-response")
+        );
+    }
+
+    #[test]
+    fn propagates_missing_generation_table_errors_in_default_conversations_dir() {
+        let fixture = Fixture::new();
+        create_summaries_database(&fixture.path(".gemini/antigravity/conversations/broken.db"));
+
+        let error = load_from_home(&fixture).unwrap_err();
 
         assert!(error.to_string().contains("gen_metadata"));
     }

@@ -40,16 +40,20 @@ fn conversation_dir(root: PathBuf) -> PathBuf {
     if nested.is_dir() { nested } else { root }
 }
 
-pub(super) fn conversation_db_paths() -> Result<Vec<PathBuf>> {
+/// Returns each `.db` path and whether it must be a conversation DB. Only a fallback
+/// scan of a default root may skip other SQLite files (e.g. `conversation_summaries.db`).
+pub(super) fn conversation_db_paths() -> Result<Vec<(PathBuf, bool)>> {
+    let explicit = env::var(ANTIGRAVITY_DATA_DIR_ENV).is_ok();
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
     for root in roots().into_iter().map(conversation_dir) {
+        let strict = explicit || root.file_name().is_some_and(|name| name == "conversations");
         let mut files = Vec::new();
         collect_files_with_extension(&root, "db", &mut files);
         for path in files {
             let canonical_path = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             if seen.insert(canonical_path) {
-                paths.push(path);
+                paths.push((path, strict));
             }
         }
     }
@@ -84,7 +88,38 @@ mod tests {
         let paths = conversation_db_paths().unwrap();
 
         assert_eq!(paths.len(), 6);
-        assert!(paths.iter().all(|path| path.extension().unwrap() == "db"));
+        assert!(
+            paths
+                .iter()
+                .all(|(path, strict)| *strict && path.extension().unwrap() == "db")
+        );
+    }
+
+    #[test]
+    fn marks_default_root_fallback_scans_as_non_strict() {
+        let fixture = fs_fixture!({
+            ".gemini/antigravity-cli/conversation_summaries.db": "",
+            ".gemini/antigravity/conversations/session.db": "",
+        });
+        let _guard = EnvVarsGuard::set_many([
+            (ANTIGRAVITY_DATA_DIR_ENV, None),
+            ("HOME", Some(OsString::from(fixture.root()))),
+            ("USERPROFILE", Some(OsString::from(fixture.root()))),
+        ]);
+
+        assert_eq!(
+            conversation_db_paths().unwrap(),
+            vec![
+                (
+                    fixture.path(".gemini/antigravity/conversations/session.db"),
+                    true
+                ),
+                (
+                    fixture.path(".gemini/antigravity-cli/conversation_summaries.db"),
+                    false
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -108,8 +143,8 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                fixture.path("direct/conversation.db"),
-                fixture.path("parent/conversations/parent.db"),
+                (fixture.path("direct/conversation.db"), true),
+                (fixture.path("parent/conversations/parent.db"), true),
             ]
         );
     }
@@ -131,7 +166,7 @@ mod tests {
 
         assert_eq!(
             conversation_db_paths().unwrap(),
-            vec![fixture.path("conversations/session.db")]
+            vec![(fixture.path("conversations/session.db"), true)]
         );
     }
 }
